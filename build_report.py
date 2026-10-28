@@ -341,16 +341,16 @@ function stockList(arr) {
 }
 
 function renderInd() {
-  const rows = indNames.map(n => [n, sum(inds[n], N - 1, N), sum(inds[n], N - 5, N), sum(inds[n], N - 20, N)]);
-  const key = win === 1 ? 1 : win === 5 ? 2 : 3;
+  const rows = indNames.map(n => [n, sum(inds[n], N - 1, N), sum(inds[n], N - 3, N), sum(inds[n], N - 5, N), sum(inds[n], N - 20, N)]]);
+  const key = win === 1 ? 1 : win === 3 ? 2 : win === 5 ? 3 : 4;
   rows.sort((a, b) => b[key] - a[key]);
-  let h = '<tr><th>產業</th><th>1日</th><th>5日</th><th>20日</th></tr>';
+  let h = '<tr><th>產業<th>1日</th><th>3日</th><th>5日</th><th>20日</th></tr>';
   for (const r of rows) {
     h += `<tr class="ind" data-n="${esc(r[0])}"><td>${open === r[0] ? '▾' : '▸'} ${esc(r[0])}</td>` +
-      [1, 2, 3].map(i => `<td style="color:${col(r[i])}">${fmt(r[i])}</td>`).join('') + '</tr>';
+      [1, 2, 3, 4].map(i => `<td style="color:${col(r[i])}">${fmt(r[i])}</td>`).join('') + '</tr>';
     if (open === r[0]) {
       const t = topStocks(r[0], win);
-      h += `<tr class="detail"><td colspan="4"><b>近 ${win} 日外資買超前 5 名</b><br>${stockList(t.buy)}<br><br><b>近 ${win} 日外資賣超前 5 名</b><br>${stockList(t.sell)}</td></tr>`;
+      h += `<tr class="detail"><td colspan="5"><b>近 ${win} 日外資買超前 5 名</b><br>${stockList(t.buy)}<br><br><b>近 ${win} 日外資賣超前 5 名</b><br>${stockList(t.sell)}</td></tr>`;
     }
   }
   $('ind').innerHTML = h;
@@ -387,12 +387,12 @@ function spark(v) {
 
 function renderWl() {
   if (!wl.length) { $('wl').innerHTML = '<tr><td class="note">還沒有自選股，上方輸入代號加入，或在產業明細按「＋」。</td></tr>'; return; }
-  let h = '<tr><th>股票</th><th>產業</th><th>1日</th><th>5日</th><th>20日</th><th>連續</th><th>走勢</th><th></th></tr>';
+  let h = '<tr><th>股票</th><th>產業</th><th>1日</th><th>3日</th><th>5日</th><th>20日</th><th>連續</th><th>走勢</th><th></th></tr>';
   for (const c of wl) {
     const s = S[c]; if (!s) continue;
     const st = streak(s.v);
     h += `<tr><td>${esc(s.n)} <span class="note">${c}</span></td><td>${esc(s.i)}</td>` +
-      [1, 5, 20].map(k => { const t = sum(s.v, N - k, N); return `<td style="color:${col(t)}">${fmt(t)}</td>`; }).join('') +
+      [1, 3, 5, 20].map(k => { const t = sum(s.v, N - k, N); return `<td style="color:${col(t)}">${fmt(t)}</td>`; }).join('') +
       `<td style="color:${col(st)}">${st === 0 ? '-' : (st > 0 ? '買' : '賣') + Math.abs(st) + '天'}</td><td>${spark(s.v)}</td><td><span class="x" data-c="${c}">✕</span></td></tr>`;
   }
   $('wl').innerHTML = h;
@@ -410,7 +410,7 @@ function init() {
   if (!N) { document.body.insertAdjacentHTML('beforeend', '<p>目前沒有資料</p>'); return; }
   $('meta').textContent = `資料日期：${dates[N - 1]}（顯示最近 ${N} 個交易日）`;
   $('stocklist').innerHTML = codes.slice().sort().map(c => `<option value="${c} ${esc(S[c].n)}">`).join('');
-  btns('winbtns', [[1, '近1日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
+  btns('winbtns', [[1, '近1日'], [3, '近3日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
   btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
   $('addbtn').onclick = () => { const c = parseInput($('q').value); if (c) addWl(c); $('q').value = ''; };
   $('q').onkeydown = e => { if (e.key === 'Enter') $('addbtn').click(); };
