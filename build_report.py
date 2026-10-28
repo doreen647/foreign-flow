@@ -1,25 +1,24 @@
 """
-每日外資「產業資金輪動」報告
-- 從證交所抓三大法人買賣超 (T86)、收盤價 (MI_INDEX)、產業別 (OpenAPI)
-- 外資買賣超股數 x 收盤價 = 估算買賣超金額（億元）
-- 按產業加總，累積到 data/industry_daily.csv
-- 產生 docs/index.html
+每日外資「產業資金輪動」報告 v2
+- 每日抓證交所外資買賣超 (T86)、收盤價 (MI_INDEX)、產業別 (OpenAPI)
+- 以「個股」為單位累積到 data/stock_daily.csv（金額單位：億元，股數 x 收盤價估算）
+- 產生 docs/index.html：內嵌資料，圖表、產業明細、自選股都在瀏覽器裡計算
 """
 import csv
 import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from html import escape
 
 import requests
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-DATA_FILE = "data/industry_daily.csv"
+DATA_FILE = "data/stock_daily.csv"
 SKIP_FILE = "data/skip_dates.txt"      # 已確認沒開市的日期（假日）
 MAP_FILE = "data/industry_map.json"    # 產業別快取
 OUT_FILE = "docs/index.html"
-BACKFILL_DAYS = 45                     # 第一次執行回補的天數
+BACKFILL_DAYS = 90                     # 第一次執行回補的日曆天數（約 60 個交易日）
+KEEP_DAYS = 60                         # 網頁內嵌最近幾個交易日
 SLEEP = 3                              # 每次請求間隔秒數，避免被證交所擋
 
 INDUSTRY_NAMES = {
@@ -75,7 +74,7 @@ def load_industry_map():
 
 
 def fetch_foreign(d):
-    """回傳 {代號: 外資買賣超股數}，若當天沒資料回傳 None"""
+    """回傳 {代號: (名稱, 外資買賣超股數)}，當天沒資料回傳 None"""
     j = get_json(
         "https://www.twse.com.tw/rwd/zh/fund/T86",
         {"date": d.strftime("%Y%m%d"), "selectType": "ALLBUT0999", "response": "json"},
@@ -84,6 +83,7 @@ def fetch_foreign(d):
         return None
     fields = j["fields"]
     i_code = fields.index("證券代號")
+    i_name = fields.index("證券名稱") if "證券名稱" in fields else None
     i_main = next((i for i, f in enumerate(fields)
                    if "外陸資買賣超" in f or "外資及陸資買賣超" in f), None)
     if i_main is None:
@@ -97,7 +97,8 @@ def fetch_foreign(d):
         v = num(row[i_main]) or 0
         if i_dealer is not None:
             v += num(row[i_dealer]) or 0
-        out[row[i_code].strip()] = v
+        name = row[i_name].strip() if i_name is not None else row[i_code].strip()
+        out[row[i_code].strip()] = (name, v)
     return out
 
 
@@ -121,7 +122,8 @@ def fetch_prices(d):
     return prices or None
 
 
-def aggregate(d, imap):
+def fetch_day(d, imap):
+    """回傳當天各股列表，沒資料回傳 None"""
     time.sleep(SLEEP)
     foreign = fetch_foreign(d)
     if foreign is None:
@@ -130,24 +132,18 @@ def aggregate(d, imap):
     prices = fetch_prices(d)
     if prices is None:
         return None
-    agg = {}
-    for code, shares in foreign.items():
+    out = []
+    for code, (name, shares) in foreign.items():
         price = prices.get(code)
-        if price is None:
+        if price is None or shares == 0:
             continue
         if code == "2330":
             ind = "台積電"
-        elif code in imap:
-            ind = imap[code]
         else:
-            ind = "ETF/其他"
-        a = agg.setdefault(ind, [0.0, 0, 0])
-        a[0] += shares * price / 1e8   # 億元
-        if shares > 0:
-            a[1] += 1
-        elif shares < 0:
-            a[2] += 1
-    return agg
+            ind = imap.get(code, "ETF/其他")
+        out.append({"date": d.isoformat(), "code": code, "name": name,
+                    "industry": ind, "net": round(shares * price / 1e8, 4)})
+    return out
 
 
 def read_history():
@@ -155,19 +151,18 @@ def read_history():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, encoding="utf-8") as f:
             for r in csv.DictReader(f):
-                rows.append({"date": r["date"], "industry": r["industry"],
-                             "net": float(r["net"]), "up": int(r["up"]), "down": int(r["down"])})
+                rows.append({"date": r["date"], "code": r["code"], "name": r["name"],
+                             "industry": r["industry"], "net": float(r["net"])})
     return rows
 
 
 def write_history(rows):
     os.makedirs("data", exist_ok=True)
-    rows.sort(key=lambda r: (r["date"], r["industry"]))
+    rows.sort(key=lambda r: (r["date"], r["code"]))
     with open(DATA_FILE, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["date", "industry", "net", "up", "down"])
+        w = csv.DictWriter(f, fieldnames=["date", "code", "name", "industry", "net"])
         w.writeheader()
-        for r in rows:
-            w.writerow({**r, "net": round(r["net"], 4)})
+        w.writerows(rows)
 
 
 def update_data():
@@ -185,14 +180,13 @@ def update_data():
         if d.weekday() >= 5 or key in have or key in skip:
             continue
         print("抓取", key)
-        agg = aggregate(d, imap)
-        if agg is None:
+        day = fetch_day(d, imap)
+        if day is None:
             print("  無資料（可能是假日或尚未公布）")
             if back >= 2:               # 最近兩天先不標記，下次再試
                 skip.add(key)
             continue
-        for ind, (net, up, down) in agg.items():
-            rows.append({"date": key, "industry": ind, "net": net, "up": up, "down": down})
+        rows.extend(day)
         have.add(key)
 
     write_history(rows)
@@ -202,100 +196,248 @@ def update_data():
     return rows
 
 
-def fmt(v):
-    return f"{v:+,.1f}"
-
-
-def color(v):
-    # 台灣習慣：紅=買超，綠=賣超
-    return "#d93025" if v > 0 else ("#188038" if v < 0 else "#666")
-
-
-def build_html(rows):
-    dates = sorted({r["date"] for r in rows})
-    if not dates:
-        return "<p>目前沒有資料</p>"
-    inds = sorted({r["industry"] for r in rows})
-
-    def total(ds, ind):
-        s = set(ds)
-        return sum(r["net"] for r in rows if r["industry"] == ind and r["date"] in s)
-
-    w1, w5, w20 = dates[-1:], dates[-5:], dates[-20:]
-    table = []
-    for ind in inds:
-        table.append((ind, total(w1, ind), total(w5, ind), total(w20, ind)))
-    table.sort(key=lambda t: -t[2])
-    max5 = max(abs(t[2]) for t in table) or 1
-
-    # 輪動：近5日 vs 前5日
-    flips = []
-    if len(dates) >= 10:
-        cur, prev = dates[-5:], dates[-10:-5]
-        for ind in inds:
-            c, p = total(cur, ind), total(prev, ind)
-            if c > 0 > p:
-                flips.append((ind, "轉買超", p, c))
-            elif c < 0 < p:
-                flips.append((ind, "轉賣超", p, c))
-        flips.sort(key=lambda t: -abs(t[3] - t[2]))
-
-    day_total = {d: sum(r["net"] for r in rows if r["date"] == d) for d in dates}
-
-    h = []
-    h.append(f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+TEMPLATE = r"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>外資產業資金輪動</title>
 <style>
-body{{font-family:-apple-system,"Noto Sans TC",sans-serif;max-width:760px;margin:0 auto;padding:16px;color:#222;line-height:1.5}}
-h1{{font-size:1.3rem}} h2{{font-size:1.05rem;margin-top:1.6rem}}
-table{{width:100%;border-collapse:collapse;font-size:.9rem}}
-th,td{{padding:6px 4px;border-bottom:1px solid #eee;text-align:right}}
-th:first-child,td:first-child{{text-align:left}}
-.bar{{height:8px;border-radius:4px;display:inline-block;vertical-align:middle}}
-.note{{color:#666;font-size:.8rem}}
-.wrap{{overflow-x:auto}}
+body{font-family:-apple-system,"Noto Sans TC",sans-serif;max-width:800px;margin:0 auto;padding:16px;color:#222;line-height:1.5}
+h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:1.8rem}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+th,td{padding:6px 4px;border-bottom:1px solid #eee;text-align:right}
+th:first-child,td:first-child{text-align:left}
+.note{color:#666;font-size:.8rem}
+.wrap{overflow-x:auto}
+.btn{border:1px solid #ccc;background:#fff;border-radius:16px;padding:4px 12px;margin:2px;font-size:.85rem;cursor:pointer}
+.btn.on{background:#222;color:#fff;border-color:#222}
+.chip{display:inline-block;border:2px solid;border-radius:14px;padding:2px 10px;margin:2px;font-size:.8rem;cursor:pointer;user-select:none}
+.ind{cursor:pointer}
+.ind:hover{background:#fafafa}
+.detail td{background:#f8f8f8;text-align:left;font-size:.82rem;vertical-align:top}
+.add{color:#1a73e8;cursor:pointer;margin-left:4px}
+input{padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;width:12em}
+.x{color:#999;cursor:pointer}
 </style></head><body>
 <h1>外資產業資金輪動</h1>
-<p class="note">資料日期：{dates[-1]}（共累積 {len(dates)} 個交易日）。金額單位：億元，以外資買賣超股數 × 收盤價估算，僅供參考。紅＝買超、綠＝賣超。</p>
-""")
+<p class="note" id="meta"></p>
+<div id="winbtns"></div>
 
-    h.append("<h2>近 5 日 vs 前 5 日：換邊的產業</h2>")
-    if not dates[-10:-5]:
-        h.append('<p class="note">累積資料不足 10 個交易日，暫無法比較。</p>')
-    elif not flips:
-        h.append('<p class="note">這一期沒有產業買賣方向反轉。</p>')
-    else:
-        h.append("<ul>")
-        for ind, kind, p, c in flips:
-            h.append(f'<li><b>{escape(ind)}</b>：{kind}（前 5 日 {fmt(p)} → 近 5 日 {fmt(c)}）</li>')
-        h.append("</ul>")
+<h2>近 5 日 vs 前 5 日：換邊的產業</h2>
+<div id="flips"></div>
 
-    h.append('<h2>各產業外資淨買賣超</h2><div class="wrap"><table><tr><th>產業</th><th>1日</th><th>5日</th><th>20日</th><th></th></tr>')
-    for ind, a, b, c in table:
-        width = int(abs(b) / max5 * 80)
-        h.append(
-            f'<tr><td>{escape(ind)}</td>'
-            f'<td style="color:{color(a)}">{fmt(a)}</td>'
-            f'<td style="color:{color(b)}">{fmt(b)}</td>'
-            f'<td style="color:{color(c)}">{fmt(c)}</td>'
-            f'<td style="text-align:left"><span class="bar" style="width:{width}px;background:{color(b)}"></span></td></tr>'
-        )
-    h.append("</table></div>")
+<h2>累積買賣超走勢</h2>
+<div id="rangebtns"></div>
+<div id="chips"></div>
+<div id="chart"></div>
 
-    h.append('<h2>外資每日合計買賣超</h2><div class="wrap"><table><tr><th>日期</th><th>合計（億）</th></tr>')
-    for d in reversed(dates[-10:]):
-        v = day_total[d]
-        h.append(f'<tr><td>{d}</td><td style="color:{color(v)}">{fmt(v)}</td></tr>')
-    h.append("</table></div>")
+<h2>各產業外資淨買賣超（點一列看個股明細）</h2>
+<div class="wrap"><table id="ind"></table></div>
 
-    h.append('<h2>最近一日各產業買超／賣超檔數</h2><div class="wrap"><table><tr><th>產業</th><th>買超檔數</th><th>賣超檔數</th></tr>')
-    for r in sorted((r for r in rows if r["date"] == dates[-1]), key=lambda r: -r["net"]):
-        h.append(f'<tr><td>{escape(r["industry"])}</td><td>{r["up"]}</td><td>{r["down"]}</td></tr>')
-    h.append("</table></div>")
+<h2>我的自選股</h2>
+<p class="note">自選股只存在你這個瀏覽器裡，換手機或電腦要重新加。只能加入近期外資有買賣紀錄的上市股票。</p>
+<input id="q" list="stocklist" placeholder="輸入代號或名稱，如 2317">
+<datalist id="stocklist"></datalist>
+<button class="btn" id="addbtn">加入</button> <span class="note" id="msg"></span>
+<div class="wrap"><table id="wl"></table></div>
 
-    h.append('<p class="note">資料來源：臺灣證券交易所。台積電獨立列出，避免半導體整體數字被單一權值股蓋過。</p></body></html>')
-    return "".join(h)
+<p class="note">金額單位：億元，以外資買賣超股數 × 收盤價估算，僅供參考。紅＝買超、綠＝賣超。資料來源：臺灣證券交易所。台積電獨立列出，避免半導體整體數字被單一權值股蓋過。</p>
+
+<script>
+const D = __DATA__;
+const dates = D.dates, S = D.stocks, N = dates.length;
+const codes = Object.keys(S);
+const PAL = ['#d93025','#1a73e8','#188038','#f9ab00','#9334e6','#e8710a','#12b5cb','#c2185b','#5f6368','#7cb342'];
+let win = 5, chartDays = 20, open = null;
+let sel = null;
+
+const sum = (v, a, b) => { let t = 0; for (let i = Math.max(0, a); i < b; i++) t += v[i]; return t; };
+const fmt = x => (x > 0 ? '+' : '') + x.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1});
+const col = x => x > 0 ? '#d93025' : x < 0 ? '#188038' : '#666';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const $ = id => document.getElementById(id);
+
+const inds = {};
+for (const c of codes) {
+  const s = S[c];
+  const o = inds[s.i] || (inds[s.i] = new Array(N).fill(0));
+  for (let i = 0; i < N; i++) o[i] += s.v[i];
+}
+const indNames = Object.keys(inds);
+
+function btns(id, opts, cur, fn) {
+  $(id).innerHTML = opts.map(o => `<button class="btn ${o[0] === cur ? 'on' : ''}" data-v="${o[0]}">${o[1]}</button>`).join('');
+  $(id).querySelectorAll('button').forEach(b => b.onclick = () => fn(Number(b.dataset.v)));
+}
+
+function renderFlips() {
+  if (N < 10) { $('flips').innerHTML = '<p class="note">累積資料不足 10 個交易日，暫無法比較。</p>'; return; }
+  const f = [];
+  for (const n of indNames) {
+    const c = sum(inds[n], N - 5, N), p = sum(inds[n], N - 10, N - 5);
+    if (c > 0 && p < 0) f.push([n, '轉買超', p, c]);
+    else if (c < 0 && p > 0) f.push([n, '轉賣超', p, c]);
+  }
+  f.sort((a, b) => Math.abs(b[3] - b[2]) - Math.abs(a[3] - a[2]));
+  $('flips').innerHTML = f.length
+    ? '<ul>' + f.map(x => `<li><b>${esc(x[0])}</b>：${x[1]}（前 5 日 ${fmt(x[2])} → 近 5 日 ${fmt(x[3])}）</li>`).join('') + '</ul>'
+    : '<p class="note">這一期沒有產業買賣方向反轉。</p>';
+}
+
+function renderChart() {
+  const k = Math.min(chartDays, N), st = N - k;
+  if (sel === null) {
+    sel = new Set(indNames.slice().sort((a, b) => Math.abs(sum(inds[b], N - 20, N)) - Math.abs(sum(inds[a], N - 20, N))).slice(0, 5));
+  }
+  const order = indNames.slice().sort((a, b) => Math.abs(sum(inds[b], N - 20, N)) - Math.abs(sum(inds[a], N - 20, N)));
+  const colorOf = {}; order.forEach((n, i) => colorOf[n] = PAL[i % PAL.length]);
+  $('chips').innerHTML = order.map(n => {
+    const on = sel.has(n), c = colorOf[n];
+    return `<span class="chip" data-n="${esc(n)}" style="border-color:${c};${on ? `background:${c};color:#fff` : `color:${c}`}">${esc(n)}</span>`;
+  }).join('');
+  $('chips').querySelectorAll('.chip').forEach(e => e.onclick = () => {
+    const n = e.dataset.n; sel.has(n) ? sel.delete(n) : sel.add(n); renderChart();
+  });
+  const series = [];
+  for (const n of order) if (sel.has(n)) {
+    let a = 0; const pts = [];
+    for (let i = st; i < N; i++) { a += inds[n][i]; pts.push(a); }
+    series.push([n, pts]);
+  }
+  const W = 700, H = 320, L = 52, R = 10, T = 10, B = 26;
+  let lo = 0, hi = 0;
+  series.forEach(s => s[1].forEach(v => { lo = Math.min(lo, v); hi = Math.max(hi, v); }));
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+  const X = i => L + (k <= 1 ? 0 : i * (W - L - R) / (k - 1));
+  const Y = v => T + (hi - v) * (H - T - B) / (hi - lo);
+  let g = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = Y(v);
+    g += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="#eee"/><text x="${L - 6}" y="${y + 4}" font-size="11" text-anchor="end" fill="#888">${Math.round(v).toLocaleString()}</text>`;
+  }
+  g += `<line x1="${L}" x2="${W - R}" y1="${Y(0)}" y2="${Y(0)}" stroke="#999" stroke-dasharray="4 3"/>`;
+  for (const idx of [0, Math.floor((k - 1) / 2), k - 1]) {
+    g += `<text x="${X(idx)}" y="${H - 8}" font-size="11" text-anchor="${idx === 0 ? 'start' : idx === k - 1 ? 'end' : 'middle'}" fill="#888">${dates[st + idx].slice(5)}</text>`;
+  }
+  for (const [n, pts] of series) {
+    g += `<polyline fill="none" stroke="${colorOf[n]}" stroke-width="2" points="${pts.map((v, i) => X(i) + ',' + Y(v)).join(' ')}"/>`;
+  }
+  $('chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${g}</svg><p class="note">每條線＝該產業在這段期間的外資累積淨買賣超（億元），起點為 0。點上方標籤可顯示／隱藏。</p>`;
+}
+
+function topStocks(ind, k) {
+  const a = [];
+  for (const c of codes) if (S[c].i === ind) {
+    const t = sum(S[c].v, N - k, N);
+    if (t) a.push([c, S[c].n, t]);
+  }
+  a.sort((x, y) => y[2] - x[2]);
+  return {buy: a.filter(x => x[2] > 0).slice(0, 5), sell: a.filter(x => x[2] < 0).slice(-5).reverse()};
+}
+
+function stockList(arr) {
+  if (!arr.length) return '<span class="note">無</span>';
+  return arr.map(x => `${esc(x[1])}(${x[0]}) <span style="color:${col(x[2])}">${fmt(x[2])}</span><span class="add" data-c="${x[0]}" title="加入自選股">＋</span>`).join('<br>');
+}
+
+function renderInd() {
+  const rows = indNames.map(n => [n, sum(inds[n], N - 1, N), sum(inds[n], N - 5, N), sum(inds[n], N - 20, N)]);
+  const key = win === 1 ? 1 : win === 5 ? 2 : 3;
+  rows.sort((a, b) => b[key] - a[key]);
+  let h = '<tr><th>產業</th><th>1日</th><th>5日</th><th>20日</th></tr>';
+  for (const r of rows) {
+    h += `<tr class="ind" data-n="${esc(r[0])}"><td>${open === r[0] ? '▾' : '▸'} ${esc(r[0])}</td>` +
+      [1, 2, 3].map(i => `<td style="color:${col(r[i])}">${fmt(r[i])}</td>`).join('') + '</tr>';
+    if (open === r[0]) {
+      const t = topStocks(r[0], win);
+      h += `<tr class="detail"><td colspan="4"><b>近 ${win} 日外資買超前 5 名</b><br>${stockList(t.buy)}<br><br><b>近 ${win} 日外資賣超前 5 名</b><br>${stockList(t.sell)}</td></tr>`;
+    }
+  }
+  $('ind').innerHTML = h;
+  $('ind').querySelectorAll('tr.ind').forEach(e => e.onclick = () => { open = open === e.dataset.n ? null : e.dataset.n; renderInd(); });
+  $('ind').querySelectorAll('.add').forEach(e => e.onclick = ev => { ev.stopPropagation(); addWl(e.dataset.c); });
+}
+
+let wl = [];
+try { wl = JSON.parse(localStorage.getItem('wl') || '[]'); } catch (e) {}
+function saveWl() { try { localStorage.setItem('wl', JSON.stringify(wl)); } catch (e) {} }
+
+function addWl(code) {
+  if (!S[code]) { $('msg').textContent = '找不到 ' + code; return; }
+  if (wl.includes(code)) { $('msg').textContent = S[code].n + ' 已在清單中'; return; }
+  wl.push(code); saveWl(); $('msg').textContent = '已加入 ' + S[code].n; renderWl();
+}
+
+function streak(v) {
+  const last = v[N - 1];
+  if (!last) return 0;
+  const sg = last > 0 ? 1 : -1;
+  let c = 0;
+  for (let i = N - 1; i >= 0; i--) { if (v[i] * sg > 0) c++; else break; }
+  return c * sg;
+}
+
+function spark(v) {
+  const k = Math.min(20, N); let a = 0; const p = [];
+  for (let i = N - k; i < N; i++) { a += v[i]; p.push(a); }
+  const lo = Math.min(0, ...p), hi = Math.max(0, ...p), r = (hi - lo) || 1;
+  const pts = p.map((x, i) => (i * 60 / Math.max(1, k - 1)) + ',' + (18 - (x - lo) / r * 16)).join(' ');
+  return `<svg viewBox="0 0 60 20" width="60" height="20"><polyline fill="none" stroke="${col(a)}" stroke-width="1.5" points="${pts}"/></svg>`;
+}
+
+function renderWl() {
+  if (!wl.length) { $('wl').innerHTML = '<tr><td class="note">還沒有自選股，上方輸入代號加入，或在產業明細按「＋」。</td></tr>'; return; }
+  let h = '<tr><th>股票</th><th>產業</th><th>1日</th><th>5日</th><th>20日</th><th>連續</th><th>走勢</th><th></th></tr>';
+  for (const c of wl) {
+    const s = S[c]; if (!s) continue;
+    const st = streak(s.v);
+    h += `<tr><td>${esc(s.n)} <span class="note">${c}</span></td><td>${esc(s.i)}</td>` +
+      [1, 5, 20].map(k => { const t = sum(s.v, N - k, N); return `<td style="color:${col(t)}">${fmt(t)}</td>`; }).join('') +
+      `<td style="color:${col(st)}">${st === 0 ? '-' : (st > 0 ? '買' : '賣') + Math.abs(st) + '天'}</td><td>${spark(s.v)}</td><td><span class="x" data-c="${c}">✕</span></td></tr>`;
+  }
+  $('wl').innerHTML = h;
+  $('wl').querySelectorAll('.x').forEach(e => e.onclick = () => { wl = wl.filter(x => x !== e.dataset.c); saveWl(); renderWl(); });
+}
+
+function parseInput(t) {
+  t = t.trim(); if (!t) return null;
+  const first = t.split(/\s+/)[0];
+  if (S[first]) return first;
+  return codes.find(c => S[c].n === t || S[c].n === t.split(/\s+/).slice(1).join('')) || first;
+}
+
+function init() {
+  if (!N) { document.body.insertAdjacentHTML('beforeend', '<p>目前沒有資料</p>'); return; }
+  $('meta').textContent = `資料日期：${dates[N - 1]}（顯示最近 ${N} 個交易日）`;
+  $('stocklist').innerHTML = codes.slice().sort().map(c => `<option value="${c} ${esc(S[c].n)}">`).join('');
+  btns('winbtns', [[1, '近1日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
+  btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
+  $('addbtn').onclick = () => { const c = parseInput($('q').value); if (c) addWl(c); $('q').value = ''; };
+  $('q').onkeydown = e => { if (e.key === 'Enter') $('addbtn').click(); };
+  renderFlips(); renderChart(); renderInd(); renderWl();
+}
+function init2() {
+  btns('winbtns', [[1, '近1日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
+  btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
+  renderChart(); renderInd();
+}
+init();
+</script></body></html>
+"""
+
+
+def build_html(rows):
+    dates = sorted({r["date"] for r in rows})[-KEEP_DAYS:]
+    idx = {d: i for i, d in enumerate(dates)}
+    stocks = {}
+    for r in rows:
+        i = idx.get(r["date"])
+        if i is None:
+            continue
+        s = stocks.setdefault(r["code"], {"n": r["name"], "i": r["industry"], "v": [0] * len(dates)})
+        s["v"][i] = round(s["v"][i] + r["net"], 3)
+    payload = json.dumps({"dates": dates, "stocks": stocks}, ensure_ascii=False, separators=(",", ":"))
+    payload = payload.replace("</", "<\\/")
+    return TEMPLATE.replace("__DATA__", payload)
 
 
 def main():
