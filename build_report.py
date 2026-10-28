@@ -434,7 +434,7 @@ def build_html(rows):
         i = idx.get(r["date"])
         if i is None:
             continue
-        s = stocks.setdefault(r["code"], {"n": r["name"], "i": r["industry"], "v": [0] * len(dates)})
+                s = stocks.setdefault(r["code"], {"n": r["name"], "i": INDUSTRY_NAMES.get(r["industry"], r["industry"]), "v": [0] * len(dates)})
         s["v"][i] = round(s["v"][i] + r["net"], 3)
     payload = json.dumps({"dates": dates, "stocks": stocks}, ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("</", "<\\/")
