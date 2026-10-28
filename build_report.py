@@ -341,7 +341,7 @@ function stockList(arr) {
 }
 
 function renderInd() {
-  const rows = indNames.map(n => [n, sum(inds[n], N - 1, N), sum(inds[n], N - 3, N), sum(inds[n], N - 5, N), sum(inds[n], N - 20, N)]]);
+  const rows = indNames.map(n => [n, sum(inds[n], N - 1, N), sum(inds[n], N - 3, N), sum(inds[n], N - 5, N), sum(inds[n], N - 20, N)]);
   const key = win === 1 ? 1 : win === 3 ? 2 : win === 5 ? 3 : 4;
   rows.sort((a, b) => b[key] - a[key]);
   let h = '<tr><th>產業<th>1日</th><th>3日</th><th>5日</th><th>20日</th></tr>';
