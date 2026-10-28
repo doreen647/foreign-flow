@@ -417,7 +417,7 @@ function init() {
   renderFlips(); renderChart(); renderInd(); renderWl();
 }
 function init2() {
-  btns('winbtns', [[1, '近1日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
+  btns('winbtns', [[1, '近1日'], [3, '近3日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
   btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
   renderChart(); renderInd();
 }
