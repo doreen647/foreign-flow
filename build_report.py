@@ -223,6 +223,89 @@ def write_history(rows):
         w.writerows(rows)
 
 
+# ===== 上櫃個股（證交所資料沒有，改抓櫃買中心）：只抓這幾檔 =====
+OTC_CODES = {"5347", "4966", "3529", "6643", "8299", "3264", "3131",
+             "3680", "6187", "6488", "5483", "3707", "5425", "8255"}
+OTC_SLEEP = 2
+
+
+def pick_foreign_idx(fields):
+    """找「外資及陸資買賣超（合計）」欄位的位置；找不到欄位名稱時用固定位置 10"""
+    for i, f in enumerate(fields):
+        if "外資" in f and "買賣超" in f and "不含" not in f and "自營商" not in f:
+            return i
+    return 10 if (not fields or len(fields) > 10) else None
+
+
+def fetch_otc_day(d):
+    """回傳 [{code, name, net}]（億元），失敗回傳 None"""
+    ad = d.strftime("%Y/%m/%d")
+    time.sleep(OTC_SLEEP)
+    q = get_json("https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
+                 {"date": ad, "response": "json"})
+    prices = {}
+    try:
+        for row in q["tables"][0]["data"]:
+            p = num(row[2])
+            if p:
+                prices[str(row[0]).strip()] = p
+    except Exception as e:
+        print("  上櫃收盤價資料格式不符：", e)
+        return None
+    if not prices:
+        return None
+    time.sleep(OTC_SLEEP)
+    j = get_json("https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
+                 {"type": "Daily", "sect": "EW", "date": ad, "response": "json"})
+    fields, data = [], []
+    if j and j.get("tables"):
+        fields, data = j["tables"][0].get("fields") or [], j["tables"][0].get("data") or []
+    if not data:  # 舊版介面備援（民國年）
+        roc = "%d/%02d/%02d" % (d.year - 1911, d.month, d.day)
+        j = get_json("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php",
+                     {"l": "zh-tw", "se": "EW", "t": "D", "d": roc, "o": "json"})
+        fields, data = (j or {}).get("fields") or [], (j or {}).get("aaData") or []
+    if not data:
+        return None
+    idx = pick_foreign_idx(fields)
+    if idx is None:
+        print("  找不到上櫃外資買賣超欄位：", fields)
+        return None
+    unit = 1000 if (fields and "仟" in fields[idx]) else 1
+    out = []
+    for row in data:
+        code = str(row[0]).strip()
+        if code not in OTC_CODES:
+            continue
+        shares = (num(row[idx]) or 0) * unit
+        price = prices.get(code)
+        if price and shares:
+            out.append({"code": code, "name": str(row[1]).strip(),
+                        "net": round(shares * price / 1e8, 4)})
+    return out
+
+
+def update_otc(rows, have):
+    done = {r["date"] for r in rows if r["industry"] == "上櫃"}
+    fails = 0
+    for key in sorted(have, reverse=True)[:KEEP_DAYS]:
+        if key in done:
+            continue
+        print("抓取上櫃", key)
+        day = fetch_otc_day(datetime.strptime(key, "%Y-%m-%d").date())
+        if day is None:
+            fails += 1
+            print("  上櫃這一天抓不到")
+            if fails >= 2:
+                print("  連續失敗，這次先停止（上市資料不受影響）")
+                return
+            continue
+        fails = 0
+        for it in day:
+            rows.append({"date": key, "code": it["code"], "name": it["name"],
+                         "industry": "上櫃", "net": it["net"]})
+
+
 def update_data():
     imap = load_industry_map()
     rows = read_history()
@@ -246,6 +329,11 @@ def update_data():
             continue
         rows.extend(day)
         have.add(key)
+
+    try:
+        update_otc(rows, have)
+    except Exception as e:  # 上櫃失敗不影響其他功能
+        print("上櫃資料更新失敗，略過：", e)
 
     write_history(rows)
     os.makedirs("data", exist_ok=True)
@@ -326,7 +414,7 @@ section.on{display:block}
 <div class="wrap"><table id="wl"></table></div>
 </section>
 
-<p class="note">金額單位：億元，以外資買賣超股數 × 收盤價估算，僅供參考。紅＝買超、綠＝賣超。資料來源：臺灣證券交易所。台積電獨立列出，避免半導體整體數字被單一權值股蓋過。</p>
+<p class="note">金額單位：億元，以外資買賣超股數 × 收盤價估算，僅供參考。紅＝買超、綠＝賣超。資料來源：臺灣證券交易所、證券櫃檯買賣中心。台積電獨立列出，避免半導體整體數字被單一權值股蓋過。</p>
 
 <script>
 const D = __DATA__;
@@ -493,6 +581,7 @@ function parseInput(t) {
 }
 
 const BLK = D.blocks || [];
+const OT = D.otc || {};
 let selBlk = null, lastCols = 0;
 
 function packDots(a) {
@@ -515,7 +604,8 @@ function renderBlocks() {
   const bl = BLK.map(b => {
     const dots = [], miss = [];
     for (const [c, nm] of Object.entries(b.stocks)) {
-      if (S[c]) dots.push({c, n: S[c].n, v: sum(S[c].v, N - win, N)}); else miss.push(nm + '(' + c + ')');
+      const st = S[c] || OT[c];
+      if (st) dots.push({c, n: st.n, v: sum(st.v, N - win, N)}); else miss.push(nm + '(' + c + ')');
     }
     return {name: b.name, dots, miss, net: dots.reduce((a, d) => a + d.v, 0)};
   });
@@ -544,7 +634,7 @@ function renderBlocks() {
   const miss = bl.flatMap(b => b.miss);
   el.innerHTML = `<svg viewBox="0 0 ${cols * CW} ${rows * CH}" style="width:100%;height:auto">${g}</svg>` +
     `<p class="note">圈圈＝區塊，點＝個股，點的大小代表外資買賣超金額（取開根號，只能粗略比較），紅＝買超、綠＝賣超，圈下數字為區塊合計（億元）。點區塊看明細。</p>` +
-    (miss.length ? `<p class="note">資料中找不到、未列入（目前只涵蓋上市股票）：${esc(miss.join('、'))}</p>` : '');
+    (miss.length ? `<p class="note">資料中找不到、未列入：${esc(miss.join('、'))}</p>` : '');
   el.querySelectorAll('.blk').forEach(e => e.onclick = () => { selBlk = selBlk === e.dataset.b ? null : e.dataset.b; renderBlocks(); });
   const sb = bl.find(b => b.name === selBlk);
   if (!sb) { $('blockdetail').innerHTML = ''; return; }
@@ -602,16 +692,16 @@ init();
 def build_html(rows):
     dates = sorted({r["date"] for r in rows})[-KEEP_DAYS:]
     idx = {d: i for i, d in enumerate(dates)}
-    stocks = {}
+    stocks, otc = {}, {}
     for r in rows:
         i = idx.get(r["date"])
         if i is None:
             continue
-        s = stocks.setdefault(r["code"], {"n": r["name"], "i": INDUSTRY_NAMES.get(r["industry"], r["industry"]), "v": [0] * len(dates)})
+        s = (otc if r["industry"] == "上櫃" else stocks).setdefault(r["code"], {"n": r["name"], "i": INDUSTRY_NAMES.get(r["industry"], r["industry"]), "v": [0] * len(dates)})
         s["v"][i] = round(s["v"][i] + r["net"], 3)
     blocks = [{"name": n, "stocks": s} for n, s in BLOCKS]
     news = fetch_all_news()
-    payload = json.dumps({"dates": dates, "stocks": stocks, "blocks": blocks, "news": news}, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps({"dates": dates, "stocks": stocks, "blocks": blocks, "otc": otc, "news": news}, ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("</", "<\\/")
     return TEMPLATE.replace("__DATA__", payload)
 
