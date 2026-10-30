@@ -421,7 +421,7 @@ const D = __DATA__;
 const dates = D.dates, S = D.stocks, N = dates.length;
 const codes = Object.keys(S);
 const PAL = ['#d93025','#1a73e8','#188038','#f9ab00','#9334e6','#e8710a','#12b5cb','#c2185b','#5f6368','#7cb342'];
-let win = 5, chartDays = 20, open = null;
+let win = 5, chartDays = 7, open = null;
 let sel = null;
 
 const sum = (v, a, b) => { let t = 0; for (let i = Math.max(0, a); i < b; i++) t += v[i]; return t; };
@@ -674,14 +674,14 @@ function init() {
   $('meta').textContent = `資料日期：${dates[N - 1]}（顯示最近 ${N} 個交易日）`;
   $('stocklist').innerHTML = codes.slice().sort().map(c => `<option value="${c} ${esc(S[c].n)}">`).join('');
   btns('winbtns', [[1, '近1日'], [3, '近3日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
-  btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
+  btns('rangebtns', [[7, '近7日'], [20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
   $('addbtn').onclick = () => { const c = parseInput($('q').value); if (c) addWl(c); $('q').value = ''; };
   $('q').onkeydown = e => { if (e.key === 'Enter') $('addbtn').click(); };
   renderFlips(); renderChart(); renderInd(); renderWl(); renderBlocks(); renderNews(); setupTabs();
 }
 function init2() {
   btns('winbtns', [[1, '近1日'], [3, '近3日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
-  btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
+  btns('rangebtns', [[7, '近7日'], [20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
   renderChart(); renderInd(); renderBlocks();
 }
 init();
