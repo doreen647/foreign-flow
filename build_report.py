@@ -8,6 +8,9 @@ import csv
 import json
 import os
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -16,6 +19,60 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 DATA_FILE = "data/stock_daily.csv"
 SKIP_FILE = "data/skip_dates.txt"      # 已確認沒開市的日期（假日）
 MAP_FILE = "data/industry_map.json"    # 產業別快取
+# ===== 半導體區塊設定：（區塊名稱, {股票代號: 名稱}），要增減個股直接改這裡 =====
+BLOCKS = [
+    ("晶圓代工", {"2330": "台積電", "2303": "聯電", "5347": "世界先進", "6770": "力積電"}),
+    ("IC設計", {"2454": "聯發科", "3034": "聯詠", "2379": "瑞昱", "2458": "義隆", "5269": "祥碩", "4966": "譜瑞-KY"}),
+    ("ASIC/IP", {"3443": "創意", "3661": "世芯-KY", "3035": "智原", "3529": "力旺", "6643": "M31"}),
+    ("記憶體", {"2408": "南亞科", "2344": "華邦電", "2337": "旺宏", "8299": "群聯"}),
+    ("封測", {"3711": "日月光投控", "6239": "力成", "2449": "京元電子", "3264": "欣銓", "6257": "矽格"}),
+    ("設備/廠務", {"3131": "弘塑", "3583": "辛耘", "3680": "家登", "6187": "萬潤", "6196": "帆宣", "2404": "漢唐"}),
+    ("矽晶圓/材料", {"6488": "環球晶", "5483": "中美晶", "3532": "台勝科", "5434": "崇越"}),
+    ("載板", {"3037": "欣興", "8046": "南電", "3189": "景碩"}),
+    ("功率/類比", {"3707": "漢磊", "3016": "嘉晶", "5425": "台半", "2481": "強茂", "8255": "朋程"}),
+]
+
+# ===== 新聞設定：只抓半導體與金融股，近 3 天 =====
+NEWS_QUERIES = {
+    "semi": "半導體 when:3d",
+    "fin": "(金融股 OR 金控 OR 銀行股) when:3d",
+}
+
+
+def fetch_news(query, limit=12):
+    url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(query)
+           + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    items, seen = [], set()
+    for it in ET.fromstring(r.content).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src_el = it.find("source")
+        src = (src_el.text or "").strip() if src_el is not None else ""
+        if src and title.endswith(" - " + src):
+            title = title[:-(len(src) + 3)]
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        try:
+            dt = parsedate_to_datetime(it.findtext("pubDate")).astimezone(timezone(timedelta(hours=8)))
+            d, ts = dt.strftime("%m/%d %H:%M"), dt.timestamp()
+        except Exception:
+            d, ts = "", 0
+        items.append({"t": title, "u": (it.findtext("link") or "").strip(), "s": src, "d": d, "ts": ts})
+    items.sort(key=lambda x: -x["ts"])
+    return [{k: v for k, v in x.items() if k != "ts"} for x in items[:limit]]
+
+
+def fetch_all_news():
+    out = {}
+    for key, q in NEWS_QUERIES.items():
+        try:
+            out[key] = fetch_news(q)
+        except Exception as e:  # 新聞抓不到不應該讓整個網頁更新失敗
+            print("news failed:", key, e)
+            out[key] = []
+    return out
 OUT_FILE = "docs/index.html"
 BACKFILL_DAYS = 90                     # 第一次執行回補的日曆天數（約 60 個交易日）
 KEEP_DAYS = 60                         # 網頁內嵌最近幾個交易日
@@ -217,11 +274,35 @@ th:first-child,td:first-child{text-align:left}
 .add{color:#1a73e8;cursor:pointer;margin-left:4px}
 input{padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;width:12em}
 .x{color:#999;cursor:pointer}
+.tabs{display:flex;gap:4px;flex-wrap:wrap;position:sticky;top:0;background:#fff;padding:8px 0;z-index:5;border-bottom:1px solid #eee}
+.tabs .btn{margin:0}
+section{display:none}
+section.on{display:block}
+.blk{cursor:pointer}
+.news{list-style:none;padding:0;margin:0}
+.news li{padding:8px 0;border-bottom:1px solid #eee}
+.news a{color:#222;text-decoration:none}
 </style></head><body>
 <h1>外資產業資金輪動</h1>
 <p class="note" id="meta"></p>
-<div id="winbtns"></div>
+<div class="tabs" id="tabs"></div>
+<div id="winbtns" style="margin-top:8px"></div>
 
+<section id="t-blocks">
+<h2>半導體區塊：外資買賣超分布</h2>
+<div id="blockchart"></div>
+<div id="blockdetail"></div>
+</section>
+
+<section id="t-news">
+<h2>半導體新聞</h2>
+<div id="news-semi"></div>
+<h2>金融股新聞</h2>
+<div id="news-fin"></div>
+<p class="note">標題與連結來自 Google 新聞，只列近 3 天，每次網頁更新時重新抓取。</p>
+</section>
+
+<section id="t-rotation">
 <h2>近 5 日 vs 前 5 日：換邊的產業</h2>
 <div id="flips"></div>
 
@@ -229,16 +310,21 @@ input{padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;wi
 <div id="rangebtns"></div>
 <div id="chips"></div>
 <div id="chart"></div>
+</section>
 
+<section id="t-industry">
 <h2>各產業外資淨買賣超（點一列看個股明細）</h2>
 <div class="wrap"><table id="ind"></table></div>
+</section>
 
+<section id="t-watchlist">
 <h2>我的自選股</h2>
 <p class="note">自選股只存在你這個瀏覽器裡，換手機或電腦要重新加。只能加入近期外資有買賣紀錄的上市股票。</p>
 <input id="q" list="stocklist" placeholder="輸入代號或名稱，如 2317">
 <datalist id="stocklist"></datalist>
 <button class="btn" id="addbtn">加入</button> <span class="note" id="msg"></span>
 <div class="wrap"><table id="wl"></table></div>
+</section>
 
 <p class="note">金額單位：億元，以外資買賣超股數 × 收盤價估算，僅供參考。紅＝買超、綠＝賣超。資料來源：臺灣證券交易所。台積電獨立列出，避免半導體整體數字被單一權值股蓋過。</p>
 
@@ -406,6 +492,93 @@ function parseInput(t) {
   return codes.find(c => S[c].n === t || S[c].n === t.split(/\s+/).slice(1).join('')) || first;
 }
 
+const BLK = D.blocks || [];
+let selBlk = null, lastCols = 0;
+
+function packDots(a) {
+  const p = [];
+  for (const d of a) {
+    if (!p.length) { d.x = 0; d.y = 0; p.push(d); continue; }
+    for (let s = 1; s < 8000; s++) {
+      d.x = 0.08 * s * Math.cos(0.25 * s); d.y = 0.08 * s * Math.sin(0.25 * s);
+      if (p.every(q => Math.hypot(q.x - d.x, q.y - d.y) >= q.r + d.r + 1.5)) break;
+    }
+    p.push(d);
+  }
+}
+
+function renderBlocks() {
+  const el = $('blockchart');
+  if (!BLK.length) { el.innerHTML = '<p class="note">尚未設定區塊（data/semi_blocks.json）。</p>'; $('blockdetail').innerHTML = ''; return; }
+  const cols = (window.innerWidth || 800) < 600 ? 2 : 3, CW = 240, CH = 250;
+  lastCols = cols;
+  const bl = BLK.map(b => {
+    const dots = [], miss = [];
+    for (const [c, nm] of Object.entries(b.stocks)) {
+      if (S[c]) dots.push({c, n: S[c].n, v: sum(S[c].v, N - win, N)}); else miss.push(nm + '(' + c + ')');
+    }
+    return {name: b.name, dots, miss, net: dots.reduce((a, d) => a + d.v, 0)};
+  });
+  const maxAbs = Math.max(1e-9, ...bl.flatMap(b => b.dots.map(d => Math.abs(d.v))));
+  const k = 27 / Math.sqrt(maxAbs);
+  let maxR = 0;
+  for (const b of bl) {
+    b.dots.sort((x, y) => Math.abs(y.v) - Math.abs(x.v));
+    b.dots.forEach(d => d.r = 3 + k * Math.sqrt(Math.abs(d.v)));
+    packDots(b.dots);
+    b.R = Math.max(10, ...b.dots.map(d => Math.hypot(d.x, d.y) + d.r)) + 6;
+    maxR = Math.max(maxR, b.R);
+  }
+  const f = Math.min(1, 100 / maxR), rows = Math.ceil(bl.length / cols);
+  let g = '';
+  bl.forEach((b, i) => {
+    const cx = (i % cols) * CW + CW / 2, oy = Math.floor(i / cols) * CH, cy = oy + 112, on = selBlk === b.name;
+    g += `<g class="blk" data-b="${esc(b.name)}"><circle cx="${cx}" cy="${cy}" r="${b.R * f}" fill="${b.net >= 0 ? '#fdecea' : '#e6f4ea'}" stroke="${on ? '#222' : '#bbb'}" stroke-width="${on ? 2.5 : 1}"/>`;
+    for (const d of b.dots) {
+      const x = cx + d.x * f, y = cy + d.y * f, r = d.r * f;
+      g += `<circle cx="${x}" cy="${y}" r="${r}" fill="${d.v > 0 ? '#d93025' : d.v < 0 ? '#188038' : '#bbb'}" fill-opacity=".8"><title>${esc(d.n)} ${fmt(d.v)}</title></circle>`;
+      if (r >= 11) g += `<text x="${x}" y="${y + 4}" font-size="11" text-anchor="middle" fill="#fff" pointer-events="none">${esc(d.n.slice(0, 4))}</text>`;
+    }
+    g += `<text x="${cx}" y="${oy + 232}" font-size="14" text-anchor="middle"><tspan font-weight="bold">${esc(b.name)}</tspan><tspan dx="6" fill="${col(b.net)}">${fmt(b.net)}</tspan></text></g>`;
+  });
+  const miss = bl.flatMap(b => b.miss);
+  el.innerHTML = `<svg viewBox="0 0 ${cols * CW} ${rows * CH}" style="width:100%;height:auto">${g}</svg>` +
+    `<p class="note">圈圈＝區塊，點＝個股，點的大小代表外資買賣超金額（取開根號，只能粗略比較），紅＝買超、綠＝賣超，圈下數字為區塊合計（億元）。點區塊看明細。</p>` +
+    (miss.length ? `<p class="note">資料中找不到、未列入（目前只涵蓋上市股票）：${esc(miss.join('、'))}</p>` : '');
+  el.querySelectorAll('.blk').forEach(e => e.onclick = () => { selBlk = selBlk === e.dataset.b ? null : e.dataset.b; renderBlocks(); });
+  const sb = bl.find(b => b.name === selBlk);
+  if (!sb) { $('blockdetail').innerHTML = ''; return; }
+  const ds = sb.dots.slice().sort((x, y) => y.v - x.v);
+  $('blockdetail').innerHTML = `<h3 style="font-size:.95rem">${esc(sb.name)}　近 ${win} 日 ${fmt(sb.net)} 億</h3><table>` +
+    ds.map(d => `<tr><td>${esc(d.n)} <span class="note">${d.c}</span></td><td style="color:${col(d.v)}">${fmt(d.v)}</td><td><span class="add" data-c="${d.c}" title="加入自選股">＋</span></td></tr>`).join('') + '</table>';
+  $('blockdetail').querySelectorAll('.add').forEach(e => e.onclick = () => { addWl(e.dataset.c); e.textContent = '✓'; });
+}
+
+const TABS = [['blocks', '區塊圖'], ['news', '新聞'], ['rotation', '輪動'], ['industry', '產業表'], ['watchlist', '自選股']];
+function showTab(id) {
+  if (!TABS.some(t => t[0] === id)) id = 'blocks';
+  $('tabs').innerHTML = TABS.map(t => `<button class="btn ${t[0] === id ? 'on' : ''}" data-t="${t[0]}">${t[1]}</button>`).join('');
+  $('tabs').querySelectorAll('button').forEach(b => b.onclick = () => showTab(b.dataset.t));
+  TABS.forEach(t => $('t-' + t[0]).classList.toggle('on', t[0] === id));
+  $('winbtns').style.display = (id === 'blocks' || id === 'industry') ? '' : 'none';
+  try { history.replaceState(null, '', '#' + id); } catch (e) {}
+}
+function renderNews() {
+  const NW = D.news || {};
+  const one = (id, arr) => {
+    $(id).innerHTML = (arr && arr.length)
+      ? '<ul class="news">' + arr.map(n => /^https?:\/\//.test(n.u) ? `<li><a href="${esc(n.u)}" target="_blank" rel="noopener noreferrer">${esc(n.t)}</a><br><span class="note">${esc(n.s)}　${esc(n.d)}</span></li>` : '').join('') + '</ul>'
+      : '<p class="note">這次沒有抓到新聞，下次更新會再試。</p>';
+  };
+  one('news-semi', NW.semi); one('news-fin', NW.fin);
+}
+
+function setupTabs() {
+  showTab(location.hash.slice(1));
+  window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
+  window.addEventListener('resize', () => { if (((window.innerWidth || 800) < 600 ? 2 : 3) !== lastCols) renderBlocks(); });
+}
+
 function init() {
   if (!N) { document.body.insertAdjacentHTML('beforeend', '<p>目前沒有資料</p>'); return; }
   $('meta').textContent = `資料日期：${dates[N - 1]}（顯示最近 ${N} 個交易日）`;
@@ -414,12 +587,12 @@ function init() {
   btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
   $('addbtn').onclick = () => { const c = parseInput($('q').value); if (c) addWl(c); $('q').value = ''; };
   $('q').onkeydown = e => { if (e.key === 'Enter') $('addbtn').click(); };
-  renderFlips(); renderChart(); renderInd(); renderWl();
+  renderFlips(); renderChart(); renderInd(); renderWl(); renderBlocks(); renderNews(); setupTabs();
 }
 function init2() {
   btns('winbtns', [[1, '近1日'], [3, '近3日'], [5, '近5日'], [20, '近20日']], win, v => { win = v; init2(); });
   btns('rangebtns', [[20, '近20日'], [60, '全部']], chartDays, v => { chartDays = v; init2(); });
-  renderChart(); renderInd();
+  renderChart(); renderInd(); renderBlocks();
 }
 init();
 </script></body></html>
@@ -436,7 +609,9 @@ def build_html(rows):
             continue
         s = stocks.setdefault(r["code"], {"n": r["name"], "i": INDUSTRY_NAMES.get(r["industry"], r["industry"]), "v": [0] * len(dates)})
         s["v"][i] = round(s["v"][i] + r["net"], 3)
-    payload = json.dumps({"dates": dates, "stocks": stocks}, ensure_ascii=False, separators=(",", ":"))
+    blocks = [{"name": n, "stocks": s} for n, s in BLOCKS]
+    news = fetch_all_news()
+    payload = json.dumps({"dates": dates, "stocks": stocks, "blocks": blocks, "news": news}, ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("</", "<\\/")
     return TEMPLATE.replace("__DATA__", payload)
 
