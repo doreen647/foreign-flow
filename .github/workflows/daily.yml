@@ -2,7 +2,7 @@ name: daily-foreign-report
 
 on:
   schedule:
-    - cron: "30 9 * * 1-5"
+    - cron: "30 0,2,4,6,9 * * 1-5"
   workflow_dispatch:
 
 permissions:
